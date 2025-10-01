@@ -1,0 +1,307 @@
+# Import the custom fix first
+import sys
+import os
+import numpy as np
+from collections import defaultdict
+
+
+# Create a custom implementation of cmd.Cmd before any other imports
+class CustomCmd:
+    def __init__(self):
+        self.prompt = '(Cmd) '
+        self.intro = None
+        self.doc_header = "Documented commands (type help <topic>):"
+        self.misc_header = "Miscellaneous help topics:"
+        self.undoc_header = "Undocumented commands:"
+        self.ruler = '='
+        self.lastcmd = ''
+        self.identchars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'
+        self.use_rawinput = 1
+        self.completekey = 'tab'
+
+
+# Patch the cmd module
+import cmd
+
+if not hasattr(cmd, 'Cmd'):
+    cmd.Cmd = CustomCmd
+    print("Successfully patched cmd module")
+
+# Now import OpenCV
+import cv2
+
+print("Successfully imported OpenCV")
+
+# Try importing YOLO with our patch
+try:
+    from ultralytics import YOLO
+
+    print("Successfully imported YOLO")
+
+    # Load a pretrained YOLOv8 model
+    model = YOLO("yolov8n.pt")  # Uses a small YOLO model for speed
+    print("Successfully loaded model")
+
+    # Load video file
+    video_path = r"C:\Users\Mohammad Affaan\Downloads\csp2\videodataset\19100392-hd_1920_1080_30fps.mp4"
+    cap = cv2.VideoCapture(video_path)
+
+    # Get video properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # Determine if portrait or landscape and set output dimensions accordingly
+    is_portrait = original_height > original_width
+
+    if is_portrait:
+        # Use original dimensions for portrait video
+        width = original_width
+        height = original_height
+    else:
+        # Swap dimensions to make landscape video portrait if needed
+        width = original_height
+        height = original_width
+
+    print(f"Video dimensions: {width}x{height}, FPS: {fps}")
+
+    # Setup output video
+    output_path = "people_detection_with_stats.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    print("Starting video processing...")
+    frame_count = 0
+
+    # Person class index in COCO dataset (used by default YOLO models) is 0
+    PERSON_CLASS_ID = 0
+
+    # For confusion matrix statistics
+    # We'll track counts: true_positives, false_positives, false_negatives
+    detection_stats = {
+        'frames_processed': 0,
+        'total_detections': 0,
+        'high_conf_detections': 0,  # confidence > 0.7
+        'medium_conf_detections': 0,  # 0.5 <= confidence <= 0.7
+        'low_conf_detections': 0,  # confidence < 0.5
+        'confidence_sum': 0  # For calculating average confidence
+    }
+
+    # Confidence threshold bins for our "confusion matrix"
+    conf_bins = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    conf_counts = defaultdict(int)
+    
+    # Create separate window for confusion matrix
+    cv2.namedWindow("Detection Statistics", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Detection Statistics", 400, 500)  # Larger size for better visibility
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break  # Stop when video ends
+
+        frame_count += 1
+        detection_stats['frames_processed'] += 1
+
+        if frame_count % 100 == 0:
+            print(f"Processed {frame_count} frames...")
+
+        # Check orientation and rotate if needed
+        if frame.shape[0] < frame.shape[1] and is_portrait:
+            # Rotate frame 90 degrees counterclockwise for portrait orientation
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif frame.shape[0] > frame.shape[1] and not is_portrait:
+            # Rotate frame 90 degrees clockwise for landscape orientation
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+
+        # Run YOLO detection
+        results = model(frame)
+
+        frame_detections = 0
+
+        # Draw only people detections
+        for r in results:
+            for box in r.boxes:
+                cls_id = int(box.cls[0])
+
+                # Only process person class (class 0 in COCO dataset)
+                if cls_id == PERSON_CLASS_ID:
+                    conf = float(box.conf[0])  # Confidence score
+                    detection_stats['total_detections'] += 1
+                    detection_stats['confidence_sum'] += conf
+
+                    # Count detections by confidence threshold
+                    for threshold in conf_bins:
+                        if conf >= threshold:
+                            conf_counts[threshold] += 1
+
+                    # Categorize by confidence level
+                    if conf > 0.7:
+                        detection_stats['high_conf_detections'] += 1
+                        color = (0, 255, 0)  # Green for high confidence
+                    elif conf >= 0.5:
+                        detection_stats['medium_conf_detections'] += 1
+                        color = (0, 255, 255)  # Yellow for medium confidence
+                    else:
+                        detection_stats['low_conf_detections'] += 1
+                        color = (0, 0, 255)  # Red for low confidence
+
+                    # Only draw detections with minimum confidence
+                    if conf > 0.3:  # Adjust this threshold as needed
+                        frame_detections += 1
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])  # Bounding box coordinates
+                        conf_str = f"{conf:.2f}"
+                        label = f"Person {conf_str}"
+
+                        # Draw bounding box and text
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        # Create confusion matrix visualization as a separate image
+        matrix_width = 400
+        matrix_height = 500
+        matrix_img = np.ones((matrix_height, matrix_width, 3), dtype=np.uint8) * 255
+
+        # Draw title
+        cv2.putText(matrix_img, "Detection Statistics", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+
+        # Draw confusion matrix frame counter
+        cv2.putText(matrix_img, f"Frame: {frame_count}", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+
+        # Draw confidence distribution
+        y_pos = 90
+        cv2.putText(matrix_img, f"Total people detected: {detection_stats['total_detections']}",
+                    (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+
+        y_pos += 30
+        if detection_stats['total_detections'] > 0:
+            avg_conf = detection_stats['confidence_sum'] / detection_stats['total_detections']
+            cv2.putText(matrix_img, f"Average confidence: {avg_conf:.2f}",
+                        (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+
+        # Draw confidence level statistics
+        y_pos += 30
+        cv2.putText(matrix_img, f"High conf (>0.7): {detection_stats['high_conf_detections']}",
+                    (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
+        
+        y_pos += 30
+        cv2.putText(matrix_img, f"Medium conf (0.5-0.7): {detection_stats['medium_conf_detections']}",
+                    (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+        
+        y_pos += 30
+        cv2.putText(matrix_img, f"Low conf (<0.5): {detection_stats['low_conf_detections']}",
+                    (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+        
+        # Current frame stats
+        y_pos += 30
+        cv2.putText(matrix_img, f"This frame: {frame_detections} people",
+                    (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+
+        # Draw confidence thresholds as a bar chart
+        chart_top = 280
+        chart_bottom = 400
+        chart_left = 50
+        chart_right = matrix_width - 50
+        chart_width = chart_right - chart_left
+        
+        # FIX: Ensure max_count is never zero
+        max_count = max(conf_counts.values()) if conf_counts and max(conf_counts.values()) > 0 else 1
+        
+        # Draw chart background
+        cv2.rectangle(matrix_img, (chart_left, chart_top), (chart_right, chart_bottom), 
+                     (220, 220, 220), -1)
+        
+        # Draw chart title
+        cv2.putText(matrix_img, "Detections by Confidence Threshold", 
+                   (chart_left, chart_top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+        
+        # Draw threshold bars
+        bar_width = chart_width / len(conf_bins)
+        
+        for i, threshold in enumerate(conf_bins):
+            x_pos = int(chart_left + i * bar_width)
+            count = conf_counts[threshold]
+            
+            # Calculate bar height (now safe from division by zero)
+            bar_height = int((count / max_count) * (chart_bottom - chart_top))
+            
+            # Determine color based on threshold
+            bar_color = (
+                int(255 * (1 - threshold)),  # B
+                int(120),                    # G
+                int(255 * threshold)         # R
+            )
+
+            # Draw bar
+            bar_top = chart_bottom - bar_height
+            cv2.rectangle(matrix_img,
+                         (int(x_pos), bar_top),
+                         (int(x_pos + bar_width - 2), chart_bottom),
+                         bar_color, -1)
+
+            # Draw threshold label
+            cv2.putText(matrix_img, f"{threshold}",
+                       (int(x_pos + bar_width/2 - 10), chart_bottom + 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            
+            # Draw count on top of bar if there's enough space
+            if bar_height > 15:  # Only draw if bar is tall enough
+                cv2.putText(matrix_img, f"{count}",
+                           (int(x_pos + bar_width/2 - 10), bar_top + 15),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+
+        # Draw axis labels
+        cv2.putText(matrix_img, "Confidence Threshold",
+                   (matrix_width // 2 - 80, chart_bottom + 40),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+
+        cv2.putText(matrix_img, "Count",
+                   (10, chart_top + (chart_bottom - chart_top) // 2),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+                   
+        # Add timestamp
+        cv2.putText(matrix_img, f"Processed frames: {detection_stats['frames_processed']}",
+                   (10, matrix_height - 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+
+        # Display confusion matrix in separate window
+        cv2.imshow("Detection Statistics", matrix_img)
+        
+        # Write frame to output video without the matrix overlay
+        out.write(frame)
+
+        # Show video with detections
+        cv2.imshow("People Detection", cv2.resize(frame, (800, 600)))
+
+        # Press 'q' to exit
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    # Print final statistics
+    print("\nDetection Statistics:")
+    print(f"Total frames processed: {detection_stats['frames_processed']}")
+    print(f"Total person detections: {detection_stats['total_detections']}")
+
+    if detection_stats['total_detections'] > 0:
+        print(f"Average confidence: {detection_stats['confidence_sum'] / detection_stats['total_detections']:.4f}")
+
+    print(f"High confidence detections (>0.7): {detection_stats['high_conf_detections']}")
+    print(f"Medium confidence detections (0.5-0.7): {detection_stats['medium_conf_detections']}")
+    print(f"Low confidence detections (<0.5): {detection_stats['low_conf_detections']}")
+
+    print("\nDetections by confidence threshold:")
+    for threshold in sorted(conf_bins):
+        print(f"  ≥{threshold:.1f}: {conf_counts[threshold]}")
+
+    cap.release()
+    out.release()
+    cv2.destroyAllWindows()
+    print(f"\nVideo processing complete. Output saved to {output_path}")
+
+except Exception as e:
+    print(f"Error: {type(e).__name__}: {e}")
+    import traceback
+
+    traceback.print_exc()
